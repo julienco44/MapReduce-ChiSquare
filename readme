@@ -1,0 +1,13 @@
+# MapReduce Chi-Square Analysis
+
+## Overview
+This project implements a MapReduce pipeline for calculating chi-square values to identify discriminative terms for each product category in the Amazon Review Dataset.
+
+## Installation
+1. Clone this repository
+2. Ensure Python 3.x is installed
+3. Install mrjob: `pip install mrjob`
+
+## Usage
+```bash
+python main.py <input_path> <output_dir> <stopwords_path>
