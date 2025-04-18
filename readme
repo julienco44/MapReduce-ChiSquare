@@ -1,4 +1,4 @@
-# MapReduce Chi-Square Analysis
+# MapReduce Chi-Square Analysis - README
 
 ## Overview
 This project implements a MapReduce pipeline for calculating chi-square values to identify discriminative terms for each product category in the Amazon Review Dataset.
@@ -11,3 +11,82 @@ This project implements a MapReduce pipeline for calculating chi-square values t
 ## Usage
 ```bash
 python main.py <input_path> <output_dir> <stopwords_path>
+
+
+## Implementation Structure
+Our implementation consists of 4 MapReduce jobs:
+1. **Document & Term Counter**: Counts document frequencies and term occurrences
+2. **Chi-Square Calculator**: Calculates chi-square values for each term in each category
+3. **Top Terms Selector**: Selects top 75 terms per category using secondary sort
+4. **Output Formatter**: Formats the final output according to requirements
+
+## Next Steps
+
+### 1. Environment Setup
+- [ ] Set up SSH access to the Hadoop cluster for all team members
+- [ ] Create local development environment with mrjob
+- [ ] Download the development dataset and stopwords file
+- [ ] Verify access to the HDFS directories
+
+### 2. Implementation Tasks
+- [ ] Code the Document & Term Counter job
+- [ ] Code the Chi-Square Calculator job
+- [ ] Code the Top Terms Selector job with secondary sort
+- [ ] Code the Output Formatter job
+- [ ] Implement the pipeline runner script
+
+### 3. Testing & Optimization
+- [ ] Test each job individually with small samples
+- [ ] Test the full pipeline with the development dataset
+- [ ] Measure performance and identify bottlenecks
+- [ ] Optimize key data structures and algorithms
+- [ ] Consider additional MapReduce optimizations (combiners, partitioners)
+
+### 4. Final Execution & Documentation
+- [ ] Run the optimized pipeline on the full dataset
+- [ ] Generate and validate the final output.txt
+- [ ] Complete the report with implementation details
+- [ ] Document the code thoroughly
+- [ ] Create the data flow diagram
+
+## What to Include in Submission
+
+### Source Code
+- `document_term_counter.py`: Implementation of Job 1
+- `chisquare_calculator.py`: Implementation of Job 2
+- `top_terms_selector.py`: Implementation of Job 3
+- `output_formatter.py`: Implementation of Job 4
+- `run_pipeline.py`: Script to run all jobs in sequence
+- Additional helper modules if needed
+
+### Output Files
+- `output.txt`: Final output from the pipeline containing:
+  - Top 75 terms per category with chi-square values
+  - Merged dictionary of all terms
+
+### Documentation
+- `report.pdf`: Complete report with:
+  - Introduction
+  - Problem Overview
+  - Methodology and Approach (including data flow diagram)
+  - Conclusions
+
+
+### Code Quality
+- Add comprehensive comments and docstrings
+- Use consistent naming conventions
+- Handle errors gracefully
+- Parameterize all paths and configurations
+
+### Performance Optimization
+- Use combiners to reduce network traffic
+- Implement secondary sort for efficient top-N selection
+- Minimize data shuffled between mappers and reducers
+- Consider in-mapper combining for frequency counting
+
+### Testing Strategy
+- Test with progressively larger datasets
+- Verify chi-square calculations with small examples
+- Check output formatting against requirements
+- Monitor resource usage on the cluster
+
