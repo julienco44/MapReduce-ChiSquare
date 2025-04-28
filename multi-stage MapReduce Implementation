@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+Memory-efficient multi-stage MapReduce implementation for chi-square analysis
+of Amazon reviews dataset.
+
+This implementation splits the processing into multiple consecutive MapReduce
+steps to reduce memory requirements and improve scalability for the full 56GB
+dataset.
+
+Author: Julian Hardt
+Date: April 2025
+"""
+
+import re
+import json
+import logging
+from mrjob.job import MRJob
+from mrjob.step import MRStep
+import mrjob.protocol
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ChiSquareMultiStage(MRJob):
+    """
+    Multi-stage MapReduce job for chi-square analysis
+    """
+    OUTPUT_PROTOCOL = mrjob.protocol.TextProtocol
+    
+    def configure_args(self):
+        """Configure command-line arguments and Hadoop parameters"""
+        super(ChiSquareMultiStage, self).configure_args()
+        self.add_file_arg("--stopwords", help="path to stopwords file")
+        
+        # Configure Hadoop for memory efficiency
+        self.add_passthru_arg('--mapreduce.map.memory.mb', '4096')
+        self.add_passthru_arg('--mapreduce.reduce.memory.mb', '8192')
+        self.add_passthru_arg('--mapreduce.map.java.opts', '-Xmx3686m')
+        self.add_passthru_arg('--mapreduce.reduce.java.opts', '-Xmx7372m')
+        self.add_passthru_arg('--mapreduce.task.io.sort.mb', '1024')
+        self.add_passthru_arg('--mapreduce.task.timeout', '1800000')  # 30 minutes
+    
+    def load_stopwords(self):
+        """Load stopwords from file"""
+        stopwords = set()
+        with open(self.options.stopwords, 'r') as f:
+            for line in f:
+                stopwords.add(line.strip().lower())
+        return stopwords
+    
+    #
+    # STEP 1: Count documents and term occurrences
+    #
+    
+    def mapper_count_init(self):
+        """Initialize the count mapper with stopwords"""
+        self.stopwords = self.load_stopwords()
+        # Regex for tokenization as per requirements
+        self.tokenize_pattern = re.compile(r'[\s\t\d\(\)\[\]\{\}\.\!\?,;:\+=\-_"\'`~#@&\*%€\$§\\\/]+')
+    
+    def mapper_count(self, _, line):
+        """
+        Process each review to count documents and term occurrences
+        
+        Args:
+            _: Ignored key
+            line: JSON string containing a review
+            
+        Yields:
+            Key-value pairs for document counts and term occurrences
+        """
+        try:
+            # Parse the JSON line
+            review = json.loads(line)
+            
+            category = review.get('category', '')
+            text = review.get('reviewText', '')
+            
+            if not category or not text:
+                return
+            
+            # Tokenize and process the text
+            tokens = [token.lower() for token in self.tokenize_pattern.split(text) if token]
+            tokens = [t for t in tokens if t not in self.stopwords and len(t) > 1 and len(t) < 50]
+            
+            # Use set to count each term only once per document
+            unique_tokens = set(tokens)
+            
+            # Emit document count for this category
+            # Use a prefix to distinguish count types
+            yield f"DOC|{category}", 1
+            yield "TOTAL_DOCS", 1
+            
+            # Emit term counts for this category
+            for token in unique_tokens:
+                yield f"TERM|{token}|{category}", 1
+                yield f"TERM_TOTAL|{token}", 1
+                
+        except json.JSONDecodeError:
+            # Skip malformed JSON lines
+            pass
+        except Exception as e:
+            logger.error(f"Error processing line: {e}")
+    
+    def combiner_count(self, key, values):
+        """
+        Combine counts locally to reduce network traffic
+        
+        Args:
+            key: Count key
+            values: List of count values (always 1 in our case)
+            
+        Yields:
+            Combined count for the key
+        """
+        yield key, sum(values)
+    
+    def reducer_count(self, key, values):
+        """
+        Reduce counts from all mappers
+        
+        Args:
+            key: Count key
+            values: List of counts
+            
+        Yields:
+            Final count for the key
+        """
+        count = sum(values)
+        yield key, count
+    
+    #
+    # STEP 2: Calculate chi-square values
+    #
+    
+    def mapper_chi_square(self, key, count):
+        """
+        Map counts to prepare for chi-square calculation
+        
+        Args:
+            key: Count key from previous step
+            count: Count value
+            
+        Yields:
+            Restructured data for chi-square calculation
+        """
+        if key == "TOTAL_DOCS":
+            # Pass through total document count
+            yield "CHI_SQUARE_METADATA", ("TOTAL_DOCS", count)
+        elif key.startswith("DOC|"):
+            # Category document count
+            category = key.split("|")[1]
+            yield "CHI_SQUARE_METADATA", ("CAT_DOCS", category, count)
+        elif key.startswith("TERM_TOTAL|"):
+            # Term total document count
+            term = key.split("|")[1]
+            yield "CHI_SQUARE_METADATA", ("TERM_TOTAL", term, count)
+        elif key.startswith("TERM|"):
+            # Term-category document count
+            _, term, category = key.split("|")
+            yield category, ("TERM_COUNT", term, count)
+    
+    def reducer_chi_square_init(self):
+        """Initialize data structures for chi-square calculation"""
+        self.total_docs = 0
+        self.category_docs = {}
+        self.term_totals = {}
+    
+    def reducer_chi_square(self, key, values):
+        """
+        Calculate chi-square values for each term-category pair
+        
+        Args:
+            key: Category or metadata key
+            values: Count values
+            
+        Yields:
+            Term and chi-square value for the category
+        """
+        if key == "CHI_SQUARE_METADATA":
+            # Process metadata first (total docs, category counts, term totals)
+            for metadata in values:
+                if metadata[0] == "TOTAL_DOCS":
+                    self.total_docs = metadata[1]
+                elif metadata[0] == "CAT_DOCS":
+                    self.category_docs[metadata[1]] = metadata[2]
+                elif metadata[0] == "TERM_TOTAL":
+                    self.term_totals[metadata[1]] = metadata[2]
+            # No yield here, just collecting metadata
+        else:
+            # This is a category key
+            category = key
+            
+            # Check if we have the needed category count
+            if category not in self.category_docs:
+                return
+            
+            # Calculate chi-square for each term in this category
+            for value_type, term, count in values:
+                if value_type == "TERM_COUNT" and term in self.term_totals:
+                    # We have all the data needed to calculate chi-square
+                    
+                    # A = documents with term in category
+                    A = count
+                    
+                    # B = documents with term NOT in category
+                    B = self.term_totals[term] - A
+                    
+                    # C = documents in category WITHOUT term
+                    C = self.category_docs[category] - A
+                    
+                    # D = documents NOT in category and WITHOUT term
+                    D = self.total_docs - A - B - C
+                    
+                    # Avoid division by zero
+                    denominator = (A + B) * (A + C) * (B + D) * (C + D)
+                    if denominator == 0:
+                        chi_square = 0
+                    else:
+                        # Chi-square calculation
+                        chi_square = (self.total_docs * ((A * D - B * C) ** 2)) / denominator
+                    
+                    # Yield category, term, and chi-square value
+                    yield f"{category}|{term}", chi_square
+    
+    #
+    # STEP 3: Select top terms per category
+    #
+    
+    def mapper_top_terms(self, key, chi_square):
+        """
+        Map term-category pairs to categories for top terms selection
+        
+        Args:
+            key: Category|term key
+            chi_square: Chi-square value
+            
+        Yields:
+            Category and term-score pair for top term selection
+        """
+        category, term = key.split("|")
+        yield category, (term, float(chi_square))
+    
+    def reducer_top_terms(self, category, term_scores):
+        """
+        Select top 75 terms for each category
+        
+        Args:
+            category: Category name
+            term_scores: List of (term, chi_square) pairs
+            
+        Yields:
+            Category with its top terms, and terms for the merged dictionary
+        """
+        # Convert to list if it's not already
+        term_scores_list = list(term_scores)
+        
+        # Get top 75 terms by chi-square value
+        top_terms = sorted(term_scores_list, key=lambda x: x[1], reverse=True)[:75]
+        
+        # Yield category with its top terms
+        formatted = f"{category} " + " ".join([f"{term}:{score}" for term, score in top_terms])
+        yield "CATEGORY", formatted
+        
+        # Also yield terms for the merged dictionary
+        for term, _ in top_terms:
+            yield "DICTIONARY", term
+    
+    #
+    # STEP 4: Format final output
+    #
+    
+    def mapper_output(self, key, value):
+        """
+        Map categories and dictionary terms to sort them correctly
+        
+        Args:
+            key: Either "CATEGORY" or "DICTIONARY"
+            value: Category line or dictionary term
+            
+        Yields:
+            Key-value pairs for proper sorting
+        """
+        if key == "CATEGORY":
+            # Extract category name for sorting
+            category = value.split(" ")[0]
+            yield "CAT_" + category, value
+        else:  # key == "DICTIONARY"
+            yield "DICT", value
+    
+    def reducer_output(self, key, values):
+        """
+        Format final output with sorted categories and dictionary
+        
+        Args:
+            key: Sort key (CAT_* or DICT)
+            values: Category lines or dictionary terms
+            
+        Yields:
+            Formatted output lines
+        """
+        if key.startswith("CAT_"):
+            # This is a category line, yield it directly
+            for value in values:
+                yield None, value
+        else:  # key == "DICT"
+            # This is the dictionary, sort and join terms
+            terms = list(values)
+            yield None, " ".join(sorted(terms))
+    
+    def steps(self):
+        """Define the multi-stage MapReduce pipeline"""
+        return [
+            # Step 1: Count documents and term occurrences
+            MRStep(
+                mapper_init=self.mapper_count_init,
+                mapper=self.mapper_count,
+                combiner=self.combiner_count,
+                reducer=self.reducer_count
+            ),
+            
+            # Step 2: Calculate chi-square values
+            MRStep(
+                mapper=self.mapper_chi_square,
+                reducer_init=self.reducer_chi_square_init,
+                reducer=self.reducer_chi_square
+            ),
+            
+            # Step 3: Select top terms per category
+            MRStep(
+                mapper=self.mapper_top_terms,
+                reducer=self.reducer_top_terms
+            ),
+            
+            # Step 4: Format final output
+            MRStep(
+                mapper=self.mapper_output,
+                reducer=self.reducer_output
+            )
+        ]
+
+if __name__ == "__main__":
+    import time
+    start_time = time.time()
+    ChiSquareMultiStage.run()
+    end_time = time.time()
+    logger.info(f"Total runtime: {end_time - start_time:.2f} seconds")
