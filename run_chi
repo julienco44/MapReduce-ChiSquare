@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+
+
+import re
+import json
+import logging
+import traceback
+from mrjob.job import MRJob
+from mrjob.step import MRStep
+import mrjob.protocol
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ChiSquareMultiStage(MRJob):
+    """
+    Multi-stage MapReduce job for chi-square analysis
+    """
+    OUTPUT_PROTOCOL = mrjob.protocol.TextProtocol
+    
+    def configure_args(self):
+        """Configure command-line arguments and Hadoop parameters"""
+        super(ChiSquareMultiStage, self).configure_args()
+        self.add_file_arg('--stopwords', help='Path to stopwords file')
+        # Configure Hadoop for memory efficiency
+        self.add_passthru_arg('--mapreduce.map.memory.mb', type=int, default=4096,
+                              help='Memory for each map task in MB')
+        self.add_passthru_arg('--mapreduce.reduce.memory.mb', type=int, default=8192,
+                              help='Memory for each reduce task in MB')
+        self.add_passthru_arg('--mapreduce.map.java.opts', type=str, default='-Xmx3686m',
+                              help='Java opts for map tasks')
+        self.add_passthru_arg('--mapreduce.reduce.java.opts', type=str, default='-Xmx7372m',
+                              help='Java opts for reduce tasks')
+        self.add_passthru_arg('--mapreduce.task.io.sort.mb', type=int, default=1024,
+                              help='I/O sort buffer size in MB')
+        self.add_passthru_arg('--mapreduce.task.timeout', type=int, default=1800000,
+                              help='Task timeout in milliseconds')
+    
+    def load_stopwords(self):
+        """Load stopwords from file"""
+        stopwords = set()
+        with open(self.options.stopwords, 'r') as f:
+            for line in f:
+                stopwords.add(line.strip().lower())
+        return stopwords
+    
+    #
+    # STEP 1: Count documents and term occurrences
+    #
+    
+    def mapper_count_init(self):
+        """Initialize the count mapper with stopwords"""
+        self.stopwords = self.load_stopwords()
+        # Use triple-quoted raw string to avoid regex quoting issues
+        self.tokenize_pattern = re.compile(
+            r'''[\s\t\d\(\)\[\]\{\}\.\!\?,;:\+=\-/_"'`~#@&\*%€\$§\\/]+'''
+        )
+    
+    def mapper_count(self, _, line):
+        try:
+            review = json.loads(line)
+            category = review.get('category', '')
+            text = review.get('reviewText', '')
+            if not category or not text:
+                return
+            tokens = [t.lower() for t in self.tokenize_pattern.split(text) if t]
+            tokens = [t for t in tokens if t not in self.stopwords and 1 < len(t) < 50]
+            unique_tokens = set(tokens)
+            yield f"DOC|{category}", 1
+            yield "TOTAL_DOCS", 1
+            for token in unique_tokens:
+                yield f"TERM|{token}|{category}", 1
+                yield f"TERM_TOTAL|{token}", 1
+        except Exception as e:
+            logger.error(f"Error in mapper_count: {traceback.format_exc()}")
+    
+    def combiner_count(self, key, values):
+        yield key, sum(values)
+    
+    def reducer_count(self, key, values):
+        yield key, sum(values)
+    
+    #
+    # STEP 2: Calculate chi-square values
+    #
+    
+    def mapper_chi_square(self, key, count):
+        """
+        Prepare counts for chi-square calculation
+        """
+        try:
+            # Convert count (string) to integer
+            cnt = int(count)
+            # Handle metadata and term counts
+            if key == "TOTAL_DOCS":
+                yield "CHI_SQUARE_METADATA", ("TOTAL_DOCS", cnt)
+            elif key.startswith("DOC|"):
+                category = key.split("|")[1]
+                yield "CHI_SQUARE_METADATA", ("CAT_DOCS", category, cnt)
+            elif key.startswith("TERM_TOTAL|"):
+                term = key.split("|")[1]
+                yield "CHI_SQUARE_METADATA", ("TERM_TOTAL", term, cnt)
+            elif key.startswith("TERM|"):
+                _, term, category = key.split("|")
+                yield category, ("TERM_COUNT", term, cnt)
+        except Exception as e:
+            logger.error(f"Error in mapper_chi_square for key={key}: {traceback.format_exc()}")
+    
+    def reducer_chi_square_init(self):
+        """Initialize data structures for chi-square calculation"""
+        self.total_docs = 0
+        self.category_docs = {}
+        self.term_totals = {}
+    
+    def reducer_chi_square(self, key, values):
+        """
+        Calculate chi-square values for each term-category pair
+        """
+        try:
+            if key == "CHI_SQUARE_METADATA":
+                for meta in values:
+                    if meta[0] == "TOTAL_DOCS":
+                        self.total_docs = meta[1]
+                    elif meta[0] == "CAT_DOCS":
+                        self.category_docs[meta[1]] = meta[2]
+                    elif meta[0] == "TERM_TOTAL":
+                        self.term_totals[meta[1]] = meta[2]
+            else:
+                category = key
+                if category not in self.category_docs:
+                    return
+                for vtype, term, cnt in values:
+                    if vtype != "TERM_COUNT" or term not in self.term_totals:
+                        continue
+                    A = cnt
+                    B = self.term_totals[term] - A
+                    C = self.category_docs[category] - A
+                    D = self.total_docs - A - B - C
+                    denom = (A+B)*(A+C)*(B+D)*(C+D)
+                    chi2 = 0 if denom == 0 else (self.total_docs * ((A*D - B*C)**2)) / denom
+                    yield f"{category}|{term}", chi2
+        except Exception as e:
+            logger.error(f"Error in reducer_chi_square for key={key}: {traceback.format_exc()}")
+    
+    #
+    # STEP 3: Select top terms per category
+    #
+    
+    def mapper_top_terms(self, key, chi_square):
+        try:
+            category, term = key.split("|")
+            yield category, (term, float(chi_square))
+        except Exception as e:
+            logger.error(f"Error in mapper_top_terms for key={key}: {traceback.format_exc()}")
+    
+    def reducer_top_terms(self, category, term_scores):
+        try:
+            scores = list(term_scores)
+            top = sorted(scores, key=lambda x: x[1], reverse=True)[:75]
+            formatted = f"{category} " + " ".join(f"{t}:{s}" for t, s in top)
+            yield "CATEGORY", formatted
+            for t, _ in top:
+                yield "DICTIONARY", t
+        except Exception as e:
+            logger.error(f"Error in reducer_top_terms for category={category}: {traceback.format_exc()}")
+    
+    #
+    # STEP 4: Format final output
+    #
+    
+    def mapper_output(self, key, value):
+        try:
+            if key == "CATEGORY":
+                cat = value.split()[0]
+                yield f"CAT_{cat}", value
+            else:
+                yield "DICT", value
+        except Exception as e:
+            logger.error(f"Error in mapper_output for key={key}: {traceback.format_exc()}")
+    
+    def reducer_output(self, key, values):
+        try:
+            if key.startswith("CAT_"):
+                for v in values:
+                    yield None, v
+            else:
+                terms = sorted(values)
+                yield None, " ".join(terms)
+        except Exception as e:
+            logger.error(f"Error in reducer_output for key={key}: {traceback.format_exc()}")
+    
+    def steps(self):
+        return [
+            MRStep(
+                mapper_init=self.mapper_count_init,
+                mapper=self.mapper_count,
+                combiner=self.combiner_count,
+                reducer=self.reducer_count
+            ),
+            MRStep(
+                mapper=self.mapper_chi_square,
+                reducer_init=self.reducer_chi_square_init,
+                reducer=self.reducer_chi_square
+            ),
+            MRStep(
+                mapper=self.mapper_top_terms,
+                reducer=self.reducer_top_terms
+            ),
+            MRStep(
+                mapper=self.mapper_output,
+                reducer=self.reducer_output
+            )
+        ]
+
+if __name__ == "__main__":
+    import time
+    start_time = time.time()
+    ChiSquareMultiStage.run()
+    end_time = time.time()
+    logger.info(f"Total runtime: {end_time - start_time:.2f} seconds")
